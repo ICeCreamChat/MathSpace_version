@@ -1,9 +1,13 @@
 from manim import *
 
-class SphereIn3D(ThreeDScene):
+class StaticSphereIn3D(ThreeDScene):
     def construct(self):
-        # 设置相机视角，确保三维效果清晰可见
-        self.set_camera_orientation(phi=75 * DEGREES, theta=30 * DEGREES)
+        # 初始相机视角 - 与原始代码保持一致
+        self.set_camera_orientation(
+            phi=75 * DEGREES,
+            theta=30 * DEGREES,
+            zoom=1.0
+        )
         
         # 创建三维坐标系
         axes = ThreeDAxes(
@@ -15,28 +19,65 @@ class SphereIn3D(ThreeDScene):
             z_length=8,
         )
         
-        # 创建球体 - 位于坐标系原点，不旋转
+        # 创建球体
         sphere = Sphere(
             radius=1.5,
-            resolution=(24, 24),  # 适当的分辨率保证平滑度
+            resolution=(30, 30),
             color=BLUE,
-            fill_opacity=0.8,
+            fill_opacity=0.6
         )
-        # 默认已在原点，无需额外shift
+        sphere.set_stroke(color=BLUE_E, width=2)
         
-        # 添加坐标系标签
-        axes_labels = axes.get_axis_labels(
-            x_label="x", y_label="y", z_label="z"
+        # 创建坐标轴标签 - 使用always_redraw确保标签始终正确显示
+        x_label = always_redraw(lambda: 
+            MathTex("x", color=RED, font_size=28)
+            .next_to(axes.x_axis.get_end(), RIGHT, buff=0.1)
+        )
+        y_label = always_redraw(lambda: 
+            MathTex("y", color=GREEN, font_size=28)
+            .next_to(axes.y_axis.get_end(), UP, buff=0.1)
+        )
+        z_label = always_redraw(lambda: 
+            MathTex("z", color=BLUE, font_size=28)
+            .next_to(axes.z_axis.get_end(), UP, buff=0.1)
+        )
+        
+        # 创建球体标签 - 固定在球体上方
+        sphere_label = always_redraw(lambda: 
+            MathTex(r"S^2", color=WHITE, font_size=36)
+            .next_to(sphere.get_center(), UP + RIGHT, buff=0.3)
         )
         
         # 动画序列
         # 1. 显示坐标系
-        self.play(Create(axes), Write(axes_labels))
+        self.play(Create(axes), run_time=1.5)
+        self.wait(0.3)
+        
+        # 2. 显示坐标轴标签
+        self.play(
+            Write(x_label),
+            Write(y_label),
+            Write(z_label)
+        )
+        self.wait(0.3)
+        
+        # 3. 显示球体
+        self.play(Create(sphere), run_time=1.5)
+        self.wait(0.3)
+        
+        # 4. 显示球体标签
+        self.play(Write(sphere_label))
         self.wait(0.5)
         
-        # 2. 显示球体（使用FadeIn使出现更自然，且不旋转）
-        self.play(FadeIn(sphere))
+        # 5. 向下移动相机视角以显示完整的三个坐标轴
+        # 使用move_camera动画展示视角变化过程
+        self.move_camera(
+            phi=60 * DEGREES,      # 减小phi角度使视角更向下
+            theta=-45 * DEGREES,   # 调整theta以显示完整的坐标系
+            zoom=0.8,              # 稍微缩小以确保所有内容在视野内
+            run_time=3
+        )
         self.wait(1)
         
-        # 3. 保持相机静止，强调球体不旋转
-        self.wait(3)
+        # 6. 最终停留
+        self.wait(2)

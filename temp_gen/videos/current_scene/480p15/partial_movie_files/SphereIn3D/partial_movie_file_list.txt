@@ -1,6 +1,0 @@
-# This file is used internally by FFMPEG.
-file 'file:D:/GitHub/MathSpace_version/temp_gen/videos/current_scene/480p15/partial_movie_files/SphereIn3D/3028389898_1227441106_223132457.mp4'
-file 'file:D:/GitHub/MathSpace_version/temp_gen/videos/current_scene/480p15/partial_movie_files/SphereIn3D/99950615_233831863_3492969036.mp4'
-file 'file:D:/GitHub/MathSpace_version/temp_gen/videos/current_scene/480p15/partial_movie_files/SphereIn3D/99950615_2548649201_3860067533.mp4'
-file 'file:D:/GitHub/MathSpace_version/temp_gen/videos/current_scene/480p15/partial_movie_files/SphereIn3D/99950615_2631580503_705375811.mp4'
-file 'file:D:/GitHub/MathSpace_version/temp_gen/videos/current_scene/480p15/partial_movie_files/SphereIn3D/99950615_4150876196_580639717.mp4'
