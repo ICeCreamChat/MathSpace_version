@@ -9,8 +9,9 @@ import subprocess
 import time
 import json
 import ast
+import hashlib
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -38,13 +39,40 @@ from prompts import (
     MONITOR_HTML
 )
 
-# ================= 📝 Pydantic 模型 =================
-class UserRequest(BaseModel):
-    prompt: str
+# ================= 📝 缓存系统 (MD5指纹) =================
+CACHE_FILE = os.path.join(TEMP_DIR, "cache.json")
 
-# ================= 🔍 代码分析器 =================
+def load_cache():
+    """加载缓存文件"""
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_cache_entry(prompt, video_url):
+    """保存缓存条目，使用MD5作为键"""
+    cache = load_cache()
+    # 使用 Prompt 的 MD5 作为键，避免特殊字符问题，确保唯一性
+    key = hashlib.md5(prompt.strip().encode('utf-8')).hexdigest()
+    cache[key] = video_url
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 缓存保存失败: {e}")
+
+def get_cached_video(prompt):
+    """尝试获取缓存的视频链接"""
+    cache = load_cache()
+    key = hashlib.md5(prompt.strip().encode('utf-8')).hexdigest()
+    return cache.get(key)
+
+# ================= 🔍 代码分析器 (静态AST) =================
 def analyze_code_structure(code: str):
-    """分析代码结构，提取重要信息"""
+    """分析代码结构，提取重要信息（类名、方法、变量等）"""
     try:
         tree = ast.parse(code)
         analysis = {
@@ -58,7 +86,10 @@ def analyze_code_structure(code: str):
         
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
-                if "Scene" in [base.id for base in node.bases if hasattr(base, 'id')]:
+                # 智能识别继承自 Scene 的类
+                base_ids = [base.id for base in node.bases if hasattr(base, 'id')]
+                # 只要继承链里有 Scene 相关的都算
+                if any(b in ['Scene', 'ThreeDScene', 'MovingCameraScene', 'ZoomedScene', 'LinearTransformationScene'] for b in base_ids):
                     analysis["scene_class"] = node.name
             elif isinstance(node, ast.FunctionDef):
                 analysis["methods"].append(node.name)
@@ -68,23 +99,21 @@ def analyze_code_structure(code: str):
                         analysis["variables"].append(target.id)
             elif isinstance(node, ast.Call):
                 if hasattr(node.func, 'attr'):
-                    if node.func.attr in ['Create', 'Play', 'Transform', 'FadeIn', 'FadeOut', 'Rotate']:
+                    if node.func.attr in ['Create', 'Play', 'Transform', 'FadeIn', 'FadeOut', 'Rotate', 'Write']:
                         analysis["animations"].append(node.func.attr)
                 if hasattr(node.func, 'id'):
-                    if node.func.id == 'Axes':
+                    if node.func.id in ['Axes', 'ThreeDAxes', 'NumberPlane']:
                         analysis["has_axes"] = True
-        
         return analysis
     except:
         return {"error": "代码解析失败"}
 
 def extract_objects_from_code(code: str):
-    """从代码中提取已定义的图形对象"""
+    """静态提取已定义的图形对象（作为动态侦探的备份方案）"""
     objects = []
-    
     # 匹配常见的Manim对象创建模式
     patterns = [
-        r'(\w+)\s*=\s*(Circle|Square|Triangle|Rectangle|Line|Dot|Text|MathTex)',
+        r'(\w+)\s*=\s*(Circle|Square|Triangle|Rectangle|Line|Dot|Text|MathTex|VGroup|Axes|NumberPlane|Sphere|Cube)',
         r'self\.add\((\w+)\)',
         r'self\.play\([^)]*(\w+)[^)]*\)',
         r'def construct\(self\):[\s\S]*?(\w+)\s*='
@@ -97,20 +126,45 @@ def extract_objects_from_code(code: str):
                 obj_name = match[0] if match[0] else match[1]
             else:
                 obj_name = match
-            if obj_name and obj_name not in ['self', 'Scene'] and obj_name not in objects:
+            if obj_name and obj_name not in ['self', 'Scene', 'run_time', 'PI'] and obj_name not in objects:
                 objects.append(obj_name)
     
     return objects
 
-# ================= 🧹 自清洁启动 =================
-def cleanup_workspace():
+# ================= 🧹 自清洁启动逻辑 (持久化版) =================
+def cleanup_workspace_startup():
+    """系统启动时的清理：只清理临时文件，保留生成的视频"""
     print("-" * 50)
-    print("🧹 [系统] 正在初始化链式工作流环境...")
+    print("🧹 [系统] 正在初始化环境 (保留历史视频)...")
+    
+    # 1. 清理临时文件夹 (temp_gen)，这是做饭的边角料，可以扔
     if os.path.exists(TEMP_DIR):
         try: 
             shutil.rmtree(TEMP_DIR)
         except: 
             pass
+            
+    # 2. 【关键】绝对不碰 STATIC_DIR 里的 .mp4 文件！
+    # 这样您重启程序后，之前的视频依然存在
+    
+    # 3. 重建目录结构
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    
+    print("✨ [系统] 状态：就绪。")
+    print("-" * 50)
+
+def hard_reset_system():
+    """彻底重置：清理所有文件，包括视频和历史记录（核按钮）"""
+    print("⚠️ [系统] 执行彻底重置...")
+    
+    # 1. 清理临时目录
+    if os.path.exists(TEMP_DIR):
+        try: shutil.rmtree(TEMP_DIR)
+        except: pass
+        
+    # 2. 清理所有视频文件
     if os.path.exists(STATIC_DIR):
         for filename in os.listdir(STATIC_DIR):
             if filename.endswith(".mp4"):
@@ -118,15 +172,21 @@ def cleanup_workspace():
                     os.remove(os.path.join(STATIC_DIR, filename))
                 except: 
                     pass
+    
+    # 3. 清理记忆文件
+    for f in [HISTORY_FILE, CONVERSATION_FILE, SCENE_FILE]:
+        if os.path.exists(f):
+            try: os.remove(f)
+            except: pass
+            
+    # 4. 重建目录
     os.makedirs(STATIC_DIR, exist_ok=True)
     os.makedirs(TEMP_DIR, exist_ok=True)
-    os.makedirs(TEMPLATES_DIR, exist_ok=True)
-    print("✨ [系统] 状态：就绪。")
-    print("-" * 50)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cleanup_workspace()
+    # 启动时只执行轻量清理，保护视频
+    cleanup_workspace_startup()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -210,17 +270,16 @@ class SmartContextManager:
             if entry.get("code_analysis", {}).get("has_axes"):
                 styles.append("使用坐标轴")
         
+        # 去重
         objects = list(set(objects))
         styles = list(set(styles))
         intents = list(set(intents))
         
         summary = f"最近{len(recent)}次交互中："
         if objects:
-            summary += f"\n- 已创建对象：{', '.join(objects[:5])}{'等' if len(objects) > 5 else ''}"
+            summary += f"\n- 已创建对象：{', '.join(objects[:5])}"
         if styles:
             summary += f"\n- 当前风格：{', '.join(styles)}"
-        if intents:
-            summary += f"\n- 用户意图倾向：{', '.join(intents)}"
         
         return {
             "text": summary,
@@ -306,26 +365,32 @@ async def find_video_file(search_dir, filename_prefix):
                 return os.path.join(root, file)
     return None
 
-@app.post("/api/chat")
-async def chat_endpoint(request: UserRequest):
-    """链式工作流主处理函数"""
+# ================= 🚀 核心工作流逻辑 (完整4步 + WebSocket + 侦探) =================
+async def process_chat_workflow(prompt: str, websocket: WebSocket):
+    """处理核心业务逻辑，通过 WebSocket 发送实时进度"""
     request_id = str(uuid.uuid4())[:8]
-    scene_name = DEFAULT_SCENE_NAME
     output_filename = f"video_{request_id}"
     
-    print(f"\n{'='*60}")
-    print(f"[{request_id}] 🧠 用户指令: {request.prompt}")
-    print(f"{'='*60}")
+    # 辅助函数：发送进度
+    async def send_status(step, message):
+        print(f"[{request_id}] {message}")
+        if websocket:
+            await websocket.send_json({
+                "type": "progress",
+                "step": step,
+                "message": message
+            })
+
+    await send_status("init", f"收到指令: {prompt}")
     
     try:
         # =======================================================
         # 🔍 第0步：分析当前状态和用户意图
         # =======================================================
-        print(f"[{request_id}] 🔍 分析当前状态和用户意图...")
-        
         current_state = context_manager.analyze_current_code()
         context_summary = context_manager.get_context_summary()
         
+        await send_status("intent", "正在分析您的意图...")
         intent_analysis = None
         try:
             intent_response = await client.chat.completions.create(
@@ -333,7 +398,7 @@ async def chat_endpoint(request: UserRequest):
                 messages=[
                     {"role": "system", "content": PROMPT_INTENT_ANALYZER},
                     {"role": "user", "content": f"""
-用户指令: {request.prompt}
+用户指令: {prompt}
 当前状态: {json.dumps(current_state, ensure_ascii=False)}
 上下文摘要: {context_summary['text']}
 
@@ -351,17 +416,12 @@ async def chat_endpoint(request: UserRequest):
         # =======================================================
         # 🎨 第一步：生成器 - 上下文感知初稿
         # =======================================================
-        print(f"[{request_id}] 🎨 生成器正在创作初稿...")
+        await send_status("generator", "正在构思动画代码...")
         start_time = time.time()
-        
-        current_code = ""
-        if os.path.exists(SCENE_FILE):
-            with open(SCENE_FILE, "r", encoding="utf-8") as f:
-                current_code = f.read()
         
         generator_input = f"""
 【用户指令】:
-{request.prompt}
+{prompt}
 
 【意图分析】:
 {json.dumps(intent_analysis, ensure_ascii=False) if intent_analysis else "未分析"}
@@ -376,12 +436,10 @@ async def chat_endpoint(request: UserRequest):
 {context_summary['text']}
 
 【具体要求】:
-1. 如果是修改或添加，请基于当前代码进行
-2. 如果是新建，可以完全重写
-3. 保持代码清晰和可读性
-4. **特别注意布局规划**：确保所有内容都在屏幕内
-5. 使用合适的转场动画管理复杂场景
-6. **文字与图形分层**：文字标签必须与图形对象分开显示，避免重叠遮挡
+1. 保持代码清晰，**必须在文件开头包含 import math 和 import numpy as np**
+2. **严禁在 MathTex 中使用中文**，中文必须用 Text() 类
+3. 如果是修改或添加，请基于当前代码进行；如果是新建，可以完全重写
+4. 确保所有内容都在屏幕内
 """
         
         gen_response = await client.chat.completions.create(
@@ -396,37 +454,17 @@ async def chat_endpoint(request: UserRequest):
         
         draft_code = extract_code_from_markdown(gen_response.choices[0].message.content)
         gen_time = time.time() - start_time
-        print(f"[{request_id}] 📝 初稿生成完成 ({gen_time:.2f}s)")
         
         # =======================================================
         # ⚖️ 第二步：分析器 - 上下文感知质检
         # =======================================================
-        print(f"[{request_id}] ⚖️ 分析器正在进行质检...")
+        await send_status("analyzer", "正在检查代码质量...")
         ana_start = time.time()
         
         analyzer_input = f"""
-【用户指令】:
-{request.prompt}
-
-【意图分析】:
-{json.dumps(intent_analysis, ensure_ascii=False) if intent_analysis else "未分析"}
-
-【当前代码状态】:
-{current_state.get('code_preview', '无现有代码')}
-
-【已存在的对象】:
-{', '.join(current_state.get('objects', [])) if current_state.get('objects') else '无'}
-
-【生成器初稿】:
-{draft_code}
-
-请特别注意检查：
-1. 布局是否合理？所有对象是否在屏幕内？
-2. **文字与图形是否分层显示？文字是否遮挡图形？**
-3. 转场动画是否合适？
-4. 代码是否实现了用户意图？
-
-请进行严格的上下文感知质检。
+【用户指令】: {prompt}
+【生成器初稿】: {draft_code}
+请检查布局、遮挡和 MathTex 中文问题。
 """
         
         ana_response = await client.chat.completions.create(
@@ -442,45 +480,17 @@ async def chat_endpoint(request: UserRequest):
         critique = ana_response.choices[0].message.content
         ana_time = time.time() - ana_start
         
-        rating = "UNKNOWN"
-        rating_match = re.search(r'\[总体评级\]\s*(PASS|WARN|FAIL)', critique, re.IGNORECASE)
-        if rating_match:
-            rating = rating_match.group(1).upper()
-        
-        print(f"[{request_id}] 📋 质检评级: {rating} ({ana_time:.2f}s)")
-        
         # =======================================================
         # 🔧 第三步：改进器 - 智能优化
         # =======================================================
-        print(f"[{request_id}] 🔧 改进器正在优化代码...")
+        await send_status("improver", "正在优化代码细节...")
         imp_start = time.time()
         
         improver_input = f"""
-【用户指令】:
-{request.prompt}
-
-【意图分析】:
-{json.dumps(intent_analysis, ensure_ascii=False) if intent_analysis else "未分析"}
-
-【当前代码状态】:
-{current_state.get('code_preview', '无现有代码')}
-
-【生成器初稿】:
-{draft_code}
-
-【分析器报告】:
-{critique}
-
-【评级】:
-{rating}
-
-请特别注意：
-1. 修复布局和边界问题
-2. **修复文字与图形的重叠问题，确保文字分层显示**
-3. 优化转场动画
-4. 确保所有对象在屏幕内
-
-请生成最终的优化代码。
+【用户指令】: {prompt}
+【初稿】: {draft_code}
+【质检报告】: {critique}
+请修复所有问题，特别是 MathTex 中文和 import math。
 """
         
         imp_response = await client.chat.completions.create(
@@ -495,38 +505,80 @@ async def chat_endpoint(request: UserRequest):
         
         final_code = extract_code_from_markdown(imp_response.choices[0].message.content)
         imp_time = time.time() - imp_start
-        print(f"[{request_id}] ✨ 最终代码生成完成 ({imp_time:.2f}s)")
         
         # =======================================================
-        # 🎬 第四步：渲染执行
+        # 🎬 第四步：渲染执行 (并发隔离 + 动态侦探)
         # =======================================================
-        print(f"[{request_id}] 🎬 开始渲染...")
+        await send_status("render", "正在渲染视频 (可能需要几分钟)...")
         
+        # 3.1 动态代码分析 (Scene Name Detection)
         code_analysis = analyze_code_structure(final_code)
-        final_objects = extract_objects_from_code(final_code)
+        scene_name = code_analysis.get("scene_class") or DEFAULT_SCENE_NAME
         
         video_url = None
         error_details = None
+        final_objects = []
         
+        # 1. 创建本次请求的专属临时目录 (并发隔离)
+        request_dir = os.path.join(TEMP_DIR, f"req_{request_id}")
+        os.makedirs(request_dir, exist_ok=True)
+        
+        # 2. 专属场景文件路径
+        local_scene_file = os.path.join(request_dir, "current_scene.py")
+        dump_file = os.path.join(request_dir, "objects_dump.json").replace("\\", "/")
+        
+        # 🔥【关键】注入 Inspector 代码 (侦探) 🔥
+        # 这是一个继承自用户 Scene 的子类，专门用于在 tear_down 时窃取对象列表
+        inspector_class_name = f"Inspector_{request_id}"
+        inspector_code = f"""
+import json
+class {inspector_class_name}({scene_name}):
+    def tear_down(self):
+        try:
+            detected_objects = []
+            # 1. 扫描属性 (self.xxx)
+            for name, value in self.__dict__.items():
+                if isinstance(value, Mobject):
+                    detected_objects.append(name)
+            # 2. 扫描屏幕上的对象 (self.mobjects)
+            for mobj in self.mobjects:
+                name = mobj.__class__.__name__
+                if name not in detected_objects:
+                    detected_objects.append(name)
+            
+            # 将检测到的对象写入临时文件
+            with open(r"{dump_file}", "w", encoding="utf-8") as f:
+                json.dump(list(set(detected_objects)), f, ensure_ascii=False)
+        except Exception as e:
+            print(f"Inspector Error: {{e}}")
+        finally:
+            super().tear_down()
+"""
+
         for attempt in range(MAX_RETRIES + 1):
-            attempt_num = attempt + 1
-            print(f"[{request_id}] 🎬 渲染尝试 {attempt_num}/{MAX_RETRIES+1}...")
+            if attempt > 0:
+                await send_status("render", f"渲染出错，正在第 {attempt} 次自动修复...")
             
-            with open(SCENE_FILE, "w", encoding="utf-8") as f:
-                f.write(final_code)
+            # 写入带侦探的代码 (源代码 + 侦探代码)
+            with open(local_scene_file, "w", encoding="utf-8") as f:
+                f.write(final_code + "\n" + inspector_code)
             
+            # 运行 Manim (运行的是 Inspector 类，而不是原类)
             cmd = [
                 sys.executable, "-m", "manim",
                 DEFAULT_QUALITY,
-                "--media_dir", TEMP_DIR,
+                "--media_dir", request_dir,
                 "-o", output_filename,
-                SCENE_FILE, scene_name
+                local_scene_file,
+                inspector_class_name # <--- 运行侦探
             ]
             
             returncode, stdout, stderr = await asyncio.to_thread(run_manim_safe, cmd)
             
             if returncode == 0:
-                video_path = await find_video_file(TEMP_DIR, output_filename)
+                # 5. 查找视频
+                video_path = await find_video_file(request_dir, output_filename)
+                
                 if video_path:
                     target_name = f"{output_filename}.mp4"
                     target_path = os.path.join(STATIC_DIR, target_name)
@@ -534,15 +586,34 @@ async def chat_endpoint(request: UserRequest):
                     shutil.move(video_path, target_path)
                     video_url = f"/static/{target_name}"
                     
+                    # 🔥 读取侦探的报告 (100% 准确的运行时数据)
+                    try:
+                        if os.path.exists(dump_file):
+                            with open(dump_file, "r", encoding="utf-8") as f:
+                                final_objects = json.load(f)
+                            print(f"[{request_id}] 🕵️ 侦探报告: {final_objects}")
+                        else:
+                            # 如果侦探失败，降级为静态正则分析
+                            print(f"[{request_id}] ⚠️ 侦探未生成报告，降级为静态分析")
+                            final_objects = extract_objects_from_code(final_code)
+                    except:
+                        final_objects = extract_objects_from_code(final_code)
+
                     print(f"[{request_id}] 🎉 渲染成功!")
+                    
+                    # 成功后更新全局状态
+                    try:
+                        with open(SCENE_FILE, "w", encoding="utf-8") as f:
+                            f.write(final_code)
+                    except Exception as e:
+                        print(f"[{request_id}] ⚠️ 全局状态更新警告: {e}")
+                        
                     break
             else:
                 error_details = stderr[-500:] if stderr else "未知错误"
                 print(f"[{request_id}] ❌ 渲染失败: {error_details[:100]}...")
                 
                 if attempt < MAX_RETRIES:
-                    print(f"[{request_id}] 🚑 启动紧急修复...")
-                    
                     fixer_prompt = PROMPT_EMERGENCY_FIXER.format(
                         error_details=error_details,
                         final_code=final_code
@@ -558,10 +629,16 @@ async def chat_endpoint(request: UserRequest):
                     )
                     
                     final_code = extract_code_from_markdown(fix_response.choices[0].message.content)
-                    print(f"[{request_id}] 🔨 修复完成，准备重试...")
+
+        # 任务结束，清理临时目录
+        try:
+            shutil.rmtree(request_dir, ignore_errors=True)
+            print(f"[{request_id}] 🧹 临时工作区已清理")
+        except:
+            pass
         
         # =======================================================
-        # 💾 第五步：保存上下文和结果
+        # 💾 第五步：保存结果与缓存
         # =======================================================
         total_time = time.time() - start_time
         
@@ -580,43 +657,88 @@ async def chat_endpoint(request: UserRequest):
             }
         }
         
-        context_manager.save_conversation(request.prompt, response_data, {
+        # 这里保存的是侦探抓取到的真实对象列表
+        context_manager.save_conversation(prompt, response_data, {
             **code_analysis,
-            "objects": final_objects
+            "objects": final_objects # <--- 真实数据
         })
         
         if video_url:
-            print(f"[{request_id}] ✅ 任务完成！总耗时: {total_time:.2f}s")
+            # 存入缓存
+            save_cache_entry(prompt, video_url)
             
-            return {
-                "status": "success",
-                "video": video_url,
-                "code": final_code,
-                "analysis": critique,
-                "intent": intent_analysis,
-                "objects": final_objects,
-                "timing": response_data["timing"]
-            }
+            if websocket:
+                await websocket.send_json({
+                    "type": "result",
+                    "status": "success",
+                    "video": video_url,
+                    "code": final_code,
+                    "timing": response_data["timing"]
+                })
         else:
-            print(f"[{request_id}] ❌ 最终失败")
-            
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "error": "渲染失败",
-                    "details": error_details,
-                    "analysis": critique,
-                    "intent": intent_analysis
-                }
-            )
+            if websocket:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "渲染失败",
+                    "details": error_details
+                })
             
     except Exception as e:
         print(f"[{request_id}] 💥 系统异常: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"系统异常: {str(e)}"}
-        )
+        if websocket:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"系统异常: {str(e)}"
+            })
 
+# ================= 🔌 WebSocket 接口 =================
+@app.websocket("/ws/chat")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    print("🔌 新的 WebSocket 连接建立")
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            prompt = data.get("prompt")
+            
+            if not prompt:
+                continue
+
+            print(f"\n{'='*60}")
+            print(f"⚡ WS 收到指令: {prompt}")
+            print(f"{'='*60}")
+
+            # 1. 检查缓存
+            cached_video = get_cached_video(prompt)
+            if cached_video:
+                print(f"✨ 命中缓存: {prompt}")
+                await websocket.send_json({
+                    "type": "progress",
+                    "step": "cache",
+                    "message": "发现相同灵感，正在调取记忆..."
+                })
+                # 稍微停顿展示一下缓存命中效果
+                await asyncio.sleep(0.5)
+                
+                await websocket.send_json({
+                    "type": "result",
+                    "status": "success",
+                    "video": cached_video,
+                    "code": "（缓存内容）",
+                    "cached": True
+                })
+                continue
+
+            # 2. 无缓存，开始完整工作流
+            await process_chat_workflow(prompt, websocket)
+            
+    except WebSocketDisconnect:
+        print("🔌 客户端断开连接")
+    except Exception as e:
+        print(f"❌ WS异常: {e}")
+
+# ================= 🌐 静态页面路由 =================
 @app.get("/")
 async def read_root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
@@ -649,9 +771,9 @@ async def debug_info():
 
 @app.post("/api/reset")
 async def reset_system():
-    """重置系统"""
-    cleanup_workspace()
-    return {"message": "系统已重置"}
+    """重置系统：这是'核按钮'，彻底删除所有数据"""
+    hard_reset_system()
+    return {"message": "系统已彻底重置"}
 
 @app.get("/api/code/current")
 async def get_current_code():
@@ -670,17 +792,16 @@ async def smart_monitor():
 if __name__ == "__main__":
     import uvicorn
     print("="*60)
-    print("✨ MathSpace 智能上下文感知系统已启动")
+    print("✨ MathSpace 智能上下文感知系统已启动 (增强版)")
     print("🌐 前端地址: http://localhost:8000")
+    print("🔌 WebSocket: ws://localhost:8000/ws/chat")
     print("📊 智能监控: http://localhost:8000/monitor")
     print("="*60)
     print("🤖 系统特色:")
-    print("  1. 智能意图分析 (CREATE/MODIFY/ADD/ENHANCE)")
-    print("  2. 深度代码结构解析")
-    print("  3. 上下文感知生成器")
-    print("  4. 实时对象追踪")
-    print("  5. 专业场景管理与布局策略")
-    print("  6. 文字分层显示规范（文字不遮挡图形）")
+    print("  1. 全流程流式反馈 (WebSocket)")
+    print("  2. 智能指令缓存 (MD5 Cache)")
+    print("  3. 渲染环境隔离 (Concurrency)")
+    print("  4. 运行时对象侦探 (Runtime Inspector)")
     print("="*60)
     
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

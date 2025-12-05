@@ -242,3 +242,32 @@ body.light-mode .icon-cream { opacity: 1; transform: rotate(0deg) scale(1); colo
     .header-bar { padding-left: 70px; }
     #mobile-menu-btn { display: flex !important; justify-content: center; align-items: center; }
 }
+
+/* 呼吸灯文字效果 */
+.breathing-text {
+    animation: textBreath 1.5s infinite ease-in-out;
+    display: inline-block;
+    font-weight: 500;
+}
+
+@keyframes textBreath {
+    0%, 100% { opacity: 1; text-shadow: 0 0 5px var(--accent-color); }
+    20% { opacity: 0.2; text-shadow: none; }
+}
+
+/* 2. 动态点点点动画 */
+.animated-dots::after {
+    content: '';
+    animation: dots 1.5s infinite;
+    display: inline-block;
+    width: 24px; /* 预留足够空间 */
+    text-align: left;
+}
+
+@keyframes dots {
+    0% { content: ''; }
+    25% { content: '.'; }
+    50% { content: '..'; }
+    75% { content: '...'; }
+    100% { content: ''; }
+}
