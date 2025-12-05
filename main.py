@@ -38,6 +38,10 @@ from prompts import (
     MONITOR_HTML
 )
 
+# ================= 📝 Pydantic 模型 =================
+class UserRequest(BaseModel):
+    prompt: str
+
 # ================= 🔍 代码分析器 =================
 def analyze_code_structure(code: str):
     """分析代码结构，提取重要信息"""
@@ -612,9 +616,6 @@ async def chat_endpoint(request: UserRequest):
             status_code=500,
             content={"error": f"系统异常: {str(e)}"}
         )
-
-class UserRequest(BaseModel):
-    prompt: str
 
 @app.get("/")
 async def read_root(request: Request):
